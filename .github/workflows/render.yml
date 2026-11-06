@@ -89,23 +89,39 @@ jobs:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the Blender download
+        uses: actions/cache@v4
+        with:
+          path: blender.tar.xz
+          key: blender-4.2.23-linux-x64-v1
       - name: Tools
-        timeout-minutes: 20
+        timeout-minutes: 12
+        env:
+          ENCODE: ${{ inputs.encode }}
         run: |
-          for i in 1 2 3; do
-            timeout 300 sudo apt-get update -y && timeout 600 sudo apt-get install -y --no-install-recommends libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 xz-utils ffmpeg && break
-            echo "apt attempt $i failed, retrying"; sleep 10
+          need=""
+          for p in libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 xz-utils; do
+            dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
           done
-          BASE=https://download.blender.org/release/Blender4.2
-          FILE=$(curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 20 --max-time 120 "$BASE/" | grep -oE 'blender-4\.2\.[0-9]+-linux-x64\.tar\.xz' | sort -uV | tail -1)
-          echo "Blender build: $FILE"
-          for i in 1 2 3 4; do
-            curl -fsSL --connect-timeout 20 --max-time 420 -o blender.tar.xz "$BASE/$FILE" && break
-            echo "download attempt $i failed, retrying"; sleep 10
-          done
+          if [ -n "$ENCODE" ] && ! command -v ffmpeg >/dev/null 2>&1; then need="$need ffmpeg"; fi
+          echo "missing packages:${need:- none}"
+          if [ -n "$need" ]; then
+            for i in 1 2 3; do
+              timeout 120 sudo apt-get update -y -o Acquire::Retries=2 && timeout 300 sudo apt-get install -y --no-install-recommends $need && break
+              echo "apt attempt $i failed, retrying"; sleep 5
+            done
+          fi
+          if [ ! -s blender.tar.xz ]; then
+            BASE=https://download.blender.org/release/Blender4.2
+            FILE=blender-4.2.23-linux-x64.tar.xz
+            for i in 1 2 3 4; do
+              curl -fsSL --connect-timeout 20 --max-time 240 -o blender.tar.xz "$BASE/$FILE" && break
+              echo "download attempt $i failed, retrying"; rm -f blender.tar.xz; sleep 5
+            done
+          fi
+          ls -la blender.tar.xz
           mkdir -p "$HOME/blender"
           tar -xf blender.tar.xz -C "$HOME/blender" --strip-components=1
-          rm blender.tar.xz
           "$HOME/blender/blender" --version | head -2
       - name: Open the bundle
         env:
