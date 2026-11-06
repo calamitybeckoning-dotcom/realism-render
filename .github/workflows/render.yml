@@ -1,0 +1,179 @@
+name: render
+on:
+  workflow_dispatch:
+    inputs:
+      frames:
+        description: "Frames, for example 1-3 or 1,5,9"
+        required: true
+      chunks:
+        description: "Parallel jobs (each is its own 4-core runner)"
+        required: false
+        default: "1"
+      samples:
+        description: "Samples per pixel"
+        required: false
+        default: "32"
+      res:
+        description: "Width in pixels"
+        required: false
+        default: "1920"
+      fmt:
+        description: "PNG or JPEG"
+        required: false
+        default: "PNG"
+      encode:
+        description: "1 = encode each chunk to one mp4 on the runner (animation)"
+        required: false
+        default: ""
+      fps:
+        description: "Frame rate of the encoded chunks"
+        required: false
+        default: "24"
+      args:
+        description: "Extra scene arguments"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+    steps:
+      - id: p
+        env:
+          FRAMES: ${{ inputs.frames }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, json
+          spec, n = os.environ["FRAMES"], max(1, int(os.environ["CHUNKS"]))
+          fr = []
+          for part in spec.split(","):
+              part = part.strip()
+              if not part:
+                  continue
+              if "-" in part:
+                  a, b = part.split("-")
+                  fr += range(int(a), int(b) + 1)
+              else:
+                  fr.append(int(part))
+          fr = sorted(set(fr))
+          n = min(n, len(fr))
+          size = -(-len(fr) // n)
+          groups = [fr[i:i + size] for i in range(0, len(fr), size)]
+          def comp(g):
+              out, s, p = [], g[0], g[0]
+              for x in g[1:]:
+                  if x == p + 1:
+                      p = x
+                      continue
+                  out.append(f"{s}-{p}" if s != p else str(s))
+                  s = p = x
+              out.append(f"{s}-{p}" if s != p else str(s))
+              return ",".join(out)
+          m = [{"id": i, "frames": comp(g)} for i, g in enumerate(groups)]
+          print("matrix=" + json.dumps(m))
+          PY
+
+  render:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 xz-utils ffmpeg
+          BASE=https://download.blender.org/release/Blender4.2
+          FILE=$(curl -fsSL "$BASE/" | grep -oE 'blender-4\.2\.[0-9]+-linux-x64\.tar\.xz' | sort -uV | tail -1)
+          echo "Blender build: $FILE"
+          curl -fsSL -o blender.tar.xz "$BASE/$FILE"
+          mkdir -p "$HOME/blender"
+          tar -xf blender.tar.xz -C "$HOME/blender" --strip-components=1
+          rm blender.tar.xz
+          "$HOME/blender/blender" --version | head -2
+      - name: Open the bundle
+        env:
+          SCENE_KEY: ${{ secrets.SCENE_KEY }}
+        run: |
+          mkdir -p work
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SCENE_KEY -in scene.bin | tar xz -C work
+          echo "bundle opened: $(ls work | wc -l) files"
+      - name: Render
+        working-directory: work
+        env:
+          FRAMES: ${{ matrix.frames }}
+          SAMPLES: ${{ inputs.samples }}
+          RES: ${{ inputs.res }}
+          FMT: ${{ inputs.fmt }}
+          XARGS: ${{ inputs.args }}
+          ENCODE: ${{ inputs.encode }}
+          FPS: ${{ inputs.fps }}
+        run: |
+          mkdir -p frames
+          echo "cores: $(nproc), RAM: $(free -g | awk '/Mem:/{print $2}') GB"
+          START=$(date +%s)
+          set +e
+          "$HOME/blender/blender" -b -noaudio --python-exit-code 1 -P scene.py -- --frames "$FRAMES" --samples "$SAMPLES" --res "$RES" --scale 100 --fmt "$FMT" --out frames $XARGS > render.log 2>&1
+          RC=$?
+          set -e
+          echo "render seconds: $(( $(date +%s) - START )), exit code $RC"
+          grep -E '^\[(frame|done|shot|warn|err)' render.log || true
+          echo "frame files: $(ls frames | wc -l)"
+          if [ -n "$ENCODE" ] && ls frames/f_*.png >/dev/null 2>&1; then
+            FIRST=$(ls frames/f_*.png | head -1 | sed -E 's/.*f_0*([0-9]+)\.png/\1/')
+            NAME=$(printf "%05d" "$FIRST")
+            mkdir -p keep
+            cp "$(ls frames/f_*.png | head -1)" keep/
+            cp "$(ls frames/f_*.png | tail -1)" keep/
+            ffmpeg -y -loglevel error -framerate "$FPS" -pattern_type glob -i 'frames/f_*.png' -vf "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" -c:v libx264 -preset slow -crf 12 -colorspace bt709 -color_primaries bt709 -color_trc bt709 "chunk-$NAME.mp4"
+            rm -f frames/f_*.png
+            mv "chunk-$NAME.mp4" frames/
+            mv keep/* frames/
+            echo "encoded chunk-$NAME.mp4"
+          fi
+          exit $RC
+      - name: Seal the results
+        if: always()
+        working-directory: work
+        env:
+          SCENE_KEY: ${{ secrets.SCENE_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          mkdir -p ../out
+          cp render.log "render-$ID.log"
+          tar cf - frames "render-$ID.log" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SCENE_KEY -out "../out/sealed-$ID.enc"
+          ls -la ../out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-${{ matrix.id }}
+          path: out
+          retention-days: 2
+          compression-level: 0
+
+  collect:
+    needs: render
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sealed-*
+          merge-multiple: true
+          path: all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: all
+          retention-days: 2
+          compression-level: 0

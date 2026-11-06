@@ -1,0 +1,7 @@
+*.key
+*.pem
+*.tgz
+frames/
+work/
+out/
+all/
