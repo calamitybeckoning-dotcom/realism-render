@@ -90,13 +90,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Tools
+        timeout-minutes: 20
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 xz-utils ffmpeg
+          for i in 1 2 3; do
+            timeout 300 sudo apt-get update -y && timeout 600 sudo apt-get install -y --no-install-recommends libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 libsm6 libice6 xz-utils ffmpeg && break
+            echo "apt attempt $i failed, retrying"; sleep 10
+          done
           BASE=https://download.blender.org/release/Blender4.2
-          FILE=$(curl -fsSL "$BASE/" | grep -oE 'blender-4\.2\.[0-9]+-linux-x64\.tar\.xz' | sort -uV | tail -1)
+          FILE=$(curl -fsSL --retry 4 --retry-delay 5 --connect-timeout 20 --max-time 120 "$BASE/" | grep -oE 'blender-4\.2\.[0-9]+-linux-x64\.tar\.xz' | sort -uV | tail -1)
           echo "Blender build: $FILE"
-          curl -fsSL -o blender.tar.xz "$BASE/$FILE"
+          for i in 1 2 3 4; do
+            curl -fsSL --connect-timeout 20 --max-time 420 -o blender.tar.xz "$BASE/$FILE" && break
+            echo "download attempt $i failed, retrying"; sleep 10
+          done
           mkdir -p "$HOME/blender"
           tar -xf blender.tar.xz -C "$HOME/blender" --strip-components=1
           rm blender.tar.xz
